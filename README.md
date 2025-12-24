@@ -1,23 +1,19 @@
-# Getting started with strike-bot
+# Reddit Strike Bot (Devvit)
 
-Your project has been created using a Devvit template.
+A configurable strike-tracking moderation bot for Reddit subreddits.
 
-## Next up
+## Features
+- Tracks user strikes on removals
+- Configurable strike keyword (e.g. #strike)
+- Time-windowed threshold (e.g. 3 strikes in 14 days)
+- Optional AutoModerator inclusion
+- Modmail alerts
+- Mod Notes integration
+- Duplicate protection
 
-Next up is uploading and developing your app using playtest.
+## Usage
+Add `#strike` (or your configured keyword) to a removal reason.
+Strikes are counted automatically.
 
-In the project directory, you can run:
-
-### `npm run deploy`
-
-Upload the app to the App Directory. Uploaded apps are only visible to you (the app owner) and can only be installed to a small test subreddit with less than 200 subscribers.
-
-### `npm run dev`
-
-Installs your app to your test subreddit and starts a playtest session where a new version is installed whenever you save changes to your app code, and logs are continuously streamed.
-
-## Learn more
-
-You can learn more in the [documentation](https://developers.reddit.com/docs/).
-
-You can manage your apps in the [developer portal](https://developers.reddit.com/my/apps).
+## Built with
+- Reddit Devvit
