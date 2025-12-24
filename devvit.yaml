@@ -1,0 +1,16 @@
+name: strike-bot
+version: 0.0.1
+entry: src/main.ts
+
+permissions:
+  redditAPI: true
+  redis: true
+
+# Optional but recommended metadata
+description: >
+  A moderation bot that tracks user strikes based on removal reasons
+  and escalates when a configurable threshold is reached.
+
+# This app relies on background triggers only
+triggers:
+  - event: ModAction
