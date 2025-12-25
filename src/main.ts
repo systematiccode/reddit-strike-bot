@@ -139,10 +139,10 @@ Devvit.addSettings([
     name: S.modNoteTemplate,
     label: 'Mod Note text template',
     helpText:
-      'Vars: {username}, {count}, {threshold}, {windowDays}, {kind}, {targetId}, {subreddit}, {matchedTagText}.',
+      'Vars: {username}, {count}, {threshold}, {windowDays}, {kind}, {targetId}, {shortId}, {permalink}, {subreddit}, {matchedTagText}.',
     scope: SettingScope.Installation,
     defaultValue:
-      'StrikeBot: u/{username} at {count}/{threshold} strikes in {windowDays}d. Latest: {kind} {targetId}. Tags: {matchedTagText}',
+      'StrikeBot: u/{username} {count}/{threshold} in {windowDays}d • Latest: {permalink} • Tags: {matchedTagText}',
     group: SETTINGS_GROUP,
   },
   {
@@ -478,7 +478,9 @@ async function maybeNotifyAndNote(args: {
     windowDays,
     kind,
     targetId,
-    matchedTags,
+    shortId: shortIdArg,
+    permalink: permalinkArg,
+matchedTags,
     modActionText,
     notifyEveryTimeOverThreshold,
     addModNote,
@@ -495,6 +497,29 @@ async function maybeNotifyAndNote(args: {
   if (!notifyEveryTimeOverThreshold && count !== threshold) {
     log(context, debug, `[ESCALATE] no: notifyEveryTimeOverThreshold=OFF and count=${count} not equal threshold`);
     return;
+  }
+  let shortId = shortIdArg || targetId;
+  let permalink = permalinkArg || '';
+
+  try {
+    if (targetId.startsWith('t3_')) {
+      shortId = targetId.replace(/^t3_/, '');
+      permalink = `https://www.reddit.com/r/${subredditName}/comments/${shortId}/`;
+    } else if (targetId.startsWith('t1_')) {
+      shortId = targetId.replace(/^t1_/, '');
+      // Best effort: try to link the exact comment if available.
+      const c = await context.reddit.getCommentById(targetId);
+      if (c?.permalink) {
+        permalink = c.permalink.startsWith('http') ? c.permalink : `https://www.reddit.com${c.permalink}`;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // Fallback: link the parent post using the best id we have.
+  if (!permalink && shortId) {
+    permalink = `https://www.reddit.com/r/${subredditName}/comments/${shortId}/`;
   }
 
   const vars: Record<string, string> = {
@@ -523,14 +548,260 @@ async function maybeNotifyAndNote(args: {
   if (addModNote) {
     try {
       const note = fillTemplate(modNoteTemplate, vars);
-      log(context, debug, `[MODNOTE] adding`, { label: modNoteLabel, note });
-      await context.reddit.addModNote({ subredditId, userId, note, label: modNoteLabel });
+      log(context, debug, `[MODNOTE] adding`, { label: toApiModNoteLabel(modNoteLabel), note });
+      await (async () => {
+      // Reddit's mod notes endpoint expects subreddit *name* and user *username* (not t5_/t2_ ids).
+      const subreddit = await context.reddit.getSubredditById(subredditId);
+      const usernameClean = normalizeUsername(username);
+      await context.reddit.addModNote({
+        subreddit: subreddit.name, // Reddit expects subreddit NAME
+        user: usernameClean, // Reddit expects username
+        note,
+        label: toApiModNoteLabel(modNoteLabel),
+        redditId: targetId, // tie the note to the removed thing when possible
+      });
+    })();
       log(context, debug, `[MODNOTE] added OK`);
     } catch (e) {
       log(context, debug, `[MODNOTE] ERROR`, { error: String(e) });
     }
   }
 }
+
+
+// ---------------------------
+// Mod menu tools (lookup/reset/remove strikes)
+// ---------------------------
+// Menu locations supported: "subreddit" | "post" | "comment". citeturn1search2
+// Forms support Paragraph/String/etc. citeturn0search0turn0search2
+
+function normalizeUsername(input: string): string {
+  const u = (input || '').trim();
+  if (!u) return '';
+  return u.startsWith('u/') ? u.slice(2) : u.startsWith('/u/') ? u.slice(3) : u.replace(/^@/, '');
+}
+
+function toApiModNoteLabel(label: string | undefined | null): string | undefined {
+  const l = (label ?? '').trim();
+  if (!l) return undefined;
+
+  // Reddit /api/mod/notes expects label enum values, not the UI display strings.
+  const map: Record<string, string> = {
+    'Abuse Warning': 'ABUSE_WARNING',
+    'Spam Warning': 'SPAM_WARNING',
+    'Spam Watch': 'SPAM_WATCH',
+    'Solid Contributor': 'SOLID_CONTRIBUTOR',
+    'Helpful User': 'HELPFUL_USER',
+    'Ban': 'BAN',
+    'Bot Ban': 'BOT_BAN',
+    'Perma Ban': 'PERMA_BAN',
+    'None': 'NONE',
+  };
+
+  return map[l] ?? l.toUpperCase().replace(/\s+/g, '_');
+}
+
+function formatStrikeList(records: StrikeRecord[], windowDays: number): string {
+  if (!records.length) return `No strikes in the last ${windowDays} days.`;
+  const sorted = [...records].sort((a, b) => b.t - a.t).slice(0, 50);
+  return sorted
+    .map((r, i) => {
+      const d = new Date(r.t).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+      return `${i + 1}) ${d} — ${r.kind.toUpperCase()} ${r.targetId}`;
+    })
+    .join('\n');
+}
+
+const strikeLookupForm = Devvit.createForm(() => ({
+  title: 'StrikeBot: Lookup strikes',
+  fields: [
+    {
+      type: 'string',
+      name: 'username',
+      label: 'Username (without u/)',
+      helpText: 'Example: hermit_toad',
+      required: true,
+    },
+  ],
+  acceptLabel: 'Lookup',
+}));
+
+const strikeViewForm = Devvit.createForm((data) => ({
+  title: 'StrikeBot: Results',
+  fields: [
+    {
+      type: 'paragraph',
+      name: 'results',
+      label: 'Strikes',
+      defaultValue: String(data?.results ?? ''),
+      disabled: true,
+    },
+  ],
+  acceptLabel: 'Close',
+}));
+
+const strikeRemoveLastForm = Devvit.createForm(() => ({
+  title: 'StrikeBot: Remove last strike',
+  fields: [
+    {
+      type: 'string',
+      name: 'username',
+      label: 'Username (without u/)',
+      required: true,
+    },
+    {
+      type: 'string',
+      name: 'confirm',
+      label: 'Type REMOVE to confirm',
+      helpText: 'This removes the most recent strike (within the configured window).',
+      required: true,
+    },
+  ],
+  acceptLabel: 'Remove',
+}));
+
+const strikeResetForm = Devvit.createForm(() => ({
+  title: 'StrikeBot: Reset strikes',
+  fields: [
+    {
+      type: 'string',
+      name: 'username',
+      label: 'Username (without u/)',
+      required: true,
+    },
+    {
+      type: 'string',
+      name: 'confirm',
+      label: 'Type RESET to confirm',
+      helpText: 'This clears all stored strikes for the user.',
+      required: true,
+    },
+  ],
+  acceptLabel: 'Reset',
+}));
+
+Devvit.addMenuItem({
+  label: 'StrikeBot: Lookup strikes',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: async (_event, context) => {
+    const cfg = await getConfig(context);
+    if (!cfg.enabled) {
+      context.ui.showToast('Strike system is disabled.');
+      return;
+    }
+
+    const res = await context.ui.showForm(strikeLookupForm);
+    if (!res) return;
+
+    const username = normalizeUsername(String(res.values?.username ?? ''));
+    if (!username) {
+      context.ui.showToast('Please enter a username.');
+      return;
+    }
+
+    const user = await context.reddit.getUserByUsername(username);
+    const userId = String(user?.id ?? '');
+    if (!userId) {
+      context.ui.showToast(`User not found: ${username}`);
+      return;
+    }
+
+    const records = pruneToWindow(await loadStrikeRecords(context, context.subredditId, userId), cfg.windowDays);
+    const results =
+      `u/${username}\n` +
+      `${records.length} strike(s) in the last ${cfg.windowDays} day(s) (threshold: ${cfg.threshold})\n\n` +
+      formatStrikeList(records, cfg.windowDays);
+
+    await context.ui.showForm(strikeViewForm, { results });
+  },
+});
+
+Devvit.addMenuItem({
+  label: 'StrikeBot: Remove last strike',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: async (_event, context) => {
+    const cfg = await getConfig(context);
+    if (!cfg.enabled) {
+      context.ui.showToast('Strike system is disabled.');
+      return;
+    }
+
+    const res = await context.ui.showForm(strikeRemoveLastForm);
+    if (!res) return;
+
+    const username = normalizeUsername(String(res.values?.username ?? ''));
+    const confirm = String(res.values?.confirm ?? '').trim().toUpperCase();
+
+    if (!username) {
+      context.ui.showToast('Please enter a username.');
+      return;
+    }
+    if (confirm !== 'REMOVE') {
+      context.ui.showToast('Cancelled (type REMOVE to confirm).');
+      return;
+    }
+
+    const user = await context.reddit.getUserByUsername(username);
+    const userId = String(user?.id ?? '');
+    if (!userId) {
+      context.ui.showToast(`User not found: ${username}`);
+      return;
+    }
+
+    const records = pruneToWindow(await loadStrikeRecords(context, context.subredditId, userId), cfg.windowDays);
+    if (!records.length) {
+      context.ui.showToast(`No strikes to remove for u/${username}.`);
+      return;
+    }
+
+    const sorted = [...records].sort((a, b) => b.t - a.t);
+    const removed = sorted.shift()!;
+    await saveStrikeRecords(context, context.subredditId, userId, sorted);
+
+    context.ui.showToast(`Removed last strike for u/${username} (${removed.kind} ${removed.targetId}).`);
+  },
+});
+
+Devvit.addMenuItem({
+  label: 'StrikeBot: Reset strikes',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: async (_event, context) => {
+    const cfg = await getConfig(context);
+    if (!cfg.enabled) {
+      context.ui.showToast('Strike system is disabled.');
+      return;
+    }
+
+    const res = await context.ui.showForm(strikeResetForm);
+    if (!res) return;
+
+    const username = normalizeUsername(String(res.values?.username ?? ''));
+    const confirm = String(res.values?.confirm ?? '').trim().toUpperCase();
+
+    if (!username) {
+      context.ui.showToast('Please enter a username.');
+      return;
+    }
+    if (confirm !== 'RESET') {
+      context.ui.showToast('Cancelled (type RESET to confirm).');
+      return;
+    }
+
+    const user = await context.reddit.getUserByUsername(username);
+    const userId = String(user?.id ?? '');
+    if (!userId) {
+      context.ui.showToast(`User not found: ${username}`);
+      return;
+    }
+
+    await saveStrikeRecords(context, context.subredditId, userId, []);
+    context.ui.showToast(`Reset strikes for u/${username}.`);
+  },
+});
+
 
 Devvit.addTrigger({
   event: 'ModAction',
