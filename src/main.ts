@@ -480,7 +480,7 @@ async function maybeNotifyAndNote(args: {
     targetId,
     shortId: shortIdArg,
     permalink: permalinkArg,
-matchedTags,
+    matchedTags,
     modActionText,
     notifyEveryTimeOverThreshold,
     addModNote,
@@ -498,6 +498,7 @@ matchedTags,
     log(context, debug, `[ESCALATE] no: notifyEveryTimeOverThreshold=OFF and count=${count} not equal threshold`);
     return;
   }
+
   let shortId = shortIdArg || targetId;
   let permalink = permalinkArg || '';
 
@@ -529,6 +530,8 @@ matchedTags,
     windowDays: String(windowDays),
     kind,
     targetId,
+    shortId,
+    permalink,
     subreddit: subredditName,
     matchedTagText: matchedTags.join(', ') || '(none)',
     modActionText: (modActionText || '(empty)').replace(/\n/g, ' '),
@@ -612,89 +615,79 @@ function formatStrikeList(records: StrikeRecord[], windowDays: number): string {
     .join('\n');
 }
 
-const strikeLookupForm = Devvit.createForm(() => ({
-  title: 'StrikeBot: Lookup strikes',
-  fields: [
-    {
-      type: 'string',
-      name: 'username',
-      label: 'Username (without u/)',
-      helpText: 'Example: hermit_toad',
-      required: true,
-    },
-  ],
-  acceptLabel: 'Lookup',
-}));
+async function formatStrikeListWithLinks(
+  context: any,
+  records: StrikeRecord[],
+  windowDays: number,
+  subredditName: string
+): Promise<string> {
+  if (!records.length) return `No strikes in the last ${windowDays} days.`;
 
-const strikeViewForm = Devvit.createForm((data) => ({
-  title: 'StrikeBot: Results',
-  fields: [
-    {
-      type: 'paragraph',
-      name: 'results',
-      label: 'Strikes',
-      defaultValue: String(data?.results ?? ''),
-      disabled: true,
-    },
-  ],
-  acceptLabel: 'Close',
-}));
+  const sorted = [...records].sort((a, b) => b.t - a.t).slice(0, 30);
 
-const strikeRemoveLastForm = Devvit.createForm(() => ({
-  title: 'StrikeBot: Remove last strike',
-  fields: [
-    {
-      type: 'string',
-      name: 'username',
-      label: 'Username (without u/)',
-      required: true,
-    },
-    {
-      type: 'string',
-      name: 'confirm',
-      label: 'Type REMOVE to confirm',
-      helpText: 'This removes the most recent strike (within the configured window).',
-      required: true,
-    },
-  ],
-  acceptLabel: 'Remove',
-}));
+  // Best-effort: get accurate permalinks for comments (limited to avoid API spam)
+  const lines: string[] = [];
+  let commentFetches = 0;
 
-const strikeResetForm = Devvit.createForm(() => ({
-  title: 'StrikeBot: Reset strikes',
-  fields: [
-    {
-      type: 'string',
-      name: 'username',
-      label: 'Username (without u/)',
-      required: true,
-    },
-    {
-      type: 'string',
-      name: 'confirm',
-      label: 'Type RESET to confirm',
-      helpText: 'This clears all stored strikes for the user.',
-      required: true,
-    },
-  ],
-  acceptLabel: 'Reset',
-}));
+  for (let i = 0; i < sorted.length; i++) {
+    const r = sorted[i];
+    const d = new Date(r.t).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
 
-Devvit.addMenuItem({
-  label: 'StrikeBot: Lookup strikes',
-  location: 'subreddit',
-  forUserType: 'moderator',
-  onPress: async (_event, context) => {
+    let url = '';
+    if (r.targetId.startsWith('t3_')) {
+      const shortId = r.targetId.replace(/^t3_/, '');
+      url = `https://www.reddit.com/r/${subredditName}/comments/${shortId}/`;
+    } else if (r.targetId.startsWith('t1_')) {
+      // Fetch exact comment permalink for the first few comment strikes only
+      if (commentFetches < 10) {
+        commentFetches++;
+        try {
+          const c = await context.reddit.getCommentById(r.targetId);
+          if (c?.permalink) {
+            url = c.permalink.startsWith('http') ? c.permalink : `https://www.reddit.com${c.permalink}`;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (!url) {
+        // Fallback: still useful to copy/paste the fullname
+        url = `https://www.reddit.com/api/info?id=${r.targetId}`;
+      }
+    } else {
+      url = `https://www.reddit.com/api/info?id=${r.targetId}`;
+    }
+
+    // Compact (fits better in the modal)
+    lines.push(`${i + 1}) ${d} — ${r.kind.toUpperCase()}
+${url}`);
+  }
+
+  return lines.join('');
+}
+
+const strikeLookupForm = Devvit.createForm(
+  () => ({
+    title: 'StrikeBot: Lookup strikes',
+    fields: [
+      {
+        type: 'string',
+        name: 'username',
+        label: 'Username (without u/)',
+        helpText: 'Example: hermit_toad',
+        required: true,
+      },
+    ],
+    acceptLabel: 'Lookup',
+  }),
+  async (event, context) => {
     const cfg = await getConfig(context);
     if (!cfg.enabled) {
       context.ui.showToast('Strike system is disabled.');
       return;
     }
 
-    const res = await context.ui.showForm(strikeLookupForm);
-    if (!res) return;
-
-    const username = normalizeUsername(String(res.values?.username ?? ''));
+    const username = normalizeUsername(String((event as any)?.values?.username ?? ''));
     if (!username) {
       context.ui.showToast('Please enter a username.');
       return;
@@ -708,31 +701,73 @@ Devvit.addMenuItem({
     }
 
     const records = pruneToWindow(await loadStrikeRecords(context, context.subredditId, userId), cfg.windowDays);
+
+    // Larger/scrollable results view (Paragraph). Tip: click inside the box, then scroll.
+    const subredditName = await context.reddit.getCurrentSubredditName();
+    const list = await formatStrikeListWithLinks(context, records, cfg.windowDays, subredditName);
+
     const results =
-      `u/${username}\n` +
-      `${records.length} strike(s) in the last ${cfg.windowDays} day(s) (threshold: ${cfg.threshold})\n\n` +
-      formatStrikeList(records, cfg.windowDays);
+      `u/${username}
+` +
+      `${records.length} strike(s) in the last ${cfg.windowDays} day(s) (threshold: ${cfg.threshold})
+` +
+      `Shown: most recent up to 30 (comments include exact permalinks for the first 10).
+
+` +
+      list;
 
     await context.ui.showForm(strikeViewForm, { results });
-  },
-});
+  }
+);
 
-Devvit.addMenuItem({
-  label: 'StrikeBot: Remove last strike',
-  location: 'subreddit',
-  forUserType: 'moderator',
-  onPress: async (_event, context) => {
+const strikeViewForm = Devvit.createForm(
+  (data) => ({
+    title: 'StrikeBot: Results (scroll inside box)',
+    fields: [
+      {
+        type: 'paragraph',
+        name: 'results',
+        label: 'Strike history (scroll to view all)',
+        defaultValue: String(data?.results ?? ''),
+        disabled: true,
+      },
+    ],
+    acceptLabel: 'Close',
+  }),
+  async () => {
+    // no-op (close)
+  }
+);
+
+const strikeRemoveLastForm = Devvit.createForm(
+  () => ({
+    title: 'StrikeBot: Remove last strike',
+    fields: [
+      {
+        type: 'string',
+        name: 'username',
+        label: 'Username (without u/)',
+        required: true,
+      },
+      {
+        type: 'string',
+        name: 'confirm',
+        label: 'Type REMOVE to confirm',
+        helpText: 'This removes the most recent strike (within the configured window).',
+        required: true,
+      },
+    ],
+    acceptLabel: 'Remove',
+  }),
+  async (event, context) => {
     const cfg = await getConfig(context);
     if (!cfg.enabled) {
       context.ui.showToast('Strike system is disabled.');
       return;
     }
 
-    const res = await context.ui.showForm(strikeRemoveLastForm);
-    if (!res) return;
-
-    const username = normalizeUsername(String(res.values?.username ?? ''));
-    const confirm = String(res.values?.confirm ?? '').trim().toUpperCase();
+    const username = normalizeUsername(String((event as any)?.values?.username ?? ''));
+    const confirm = String((event as any)?.values?.confirm ?? '').trim().toUpperCase();
 
     if (!username) {
       context.ui.showToast('Please enter a username.');
@@ -752,34 +787,47 @@ Devvit.addMenuItem({
 
     const records = pruneToWindow(await loadStrikeRecords(context, context.subredditId, userId), cfg.windowDays);
     if (!records.length) {
-      context.ui.showToast(`No strikes to remove for u/${username}.`);
+      context.ui.showToast('No strikes to remove.');
       return;
     }
 
-    const sorted = [...records].sort((a, b) => b.t - a.t);
-    const removed = sorted.shift()!;
-    await saveStrikeRecords(context, context.subredditId, userId, sorted);
+    records.sort((a, b) => b.t - a.t);
+    const removed = records.shift()!;
+    await saveStrikeRecords(context, context.subredditId, userId, records);
 
-    context.ui.showToast(`Removed last strike for u/${username} (${removed.kind} ${removed.targetId}).`);
-  },
-});
+    context.ui.showToast(`Removed last strike (${removed.kind} ${removed.targetId}) for u/${username}`);
+  }
+);
 
-Devvit.addMenuItem({
-  label: 'StrikeBot: Reset strikes',
-  location: 'subreddit',
-  forUserType: 'moderator',
-  onPress: async (_event, context) => {
+const strikeResetForm = Devvit.createForm(
+  () => ({
+    title: 'StrikeBot: Reset strikes',
+    fields: [
+      {
+        type: 'string',
+        name: 'username',
+        label: 'Username (without u/)',
+        required: true,
+      },
+      {
+        type: 'string',
+        name: 'confirm',
+        label: 'Type RESET to confirm',
+        helpText: 'This clears all stored strikes for the user.',
+        required: true,
+      },
+    ],
+    acceptLabel: 'Reset',
+  }),
+  async (event, context) => {
     const cfg = await getConfig(context);
     if (!cfg.enabled) {
       context.ui.showToast('Strike system is disabled.');
       return;
     }
 
-    const res = await context.ui.showForm(strikeResetForm);
-    if (!res) return;
-
-    const username = normalizeUsername(String(res.values?.username ?? ''));
-    const confirm = String(res.values?.confirm ?? '').trim().toUpperCase();
+    const username = normalizeUsername(String((event as any)?.values?.username ?? ''));
+    const confirm = String((event as any)?.values?.confirm ?? '').trim().toUpperCase();
 
     if (!username) {
       context.ui.showToast('Please enter a username.');
@@ -798,7 +846,35 @@ Devvit.addMenuItem({
     }
 
     await saveStrikeRecords(context, context.subredditId, userId, []);
-    context.ui.showToast(`Reset strikes for u/${username}.`);
+    context.ui.showToast(`Reset strikes for u/${username}`);
+  }
+);
+
+Devvit.addMenuItem({
+
+  label: 'StrikeBot: Lookup strikes',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: async (_event, context) => {
+    await context.ui.showForm(strikeLookupForm);
+  },
+});
+
+Devvit.addMenuItem({
+  label: 'StrikeBot: Remove last strike',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: async (_event, context) => {
+    await context.ui.showForm(strikeRemoveLastForm);
+  },
+});
+
+Devvit.addMenuItem({
+  label: 'StrikeBot: Reset strikes',
+  location: 'subreddit',
+  forUserType: 'moderator',
+  onPress: async (_event, context) => {
+    await context.ui.showForm(strikeResetForm);
   },
 });
 
