@@ -584,6 +584,60 @@ function normalizeUsername(input: string): string {
   return u.startsWith('u/') ? u.slice(2) : u.startsWith('/u/') ? u.slice(3) : u.replace(/^@/, '');
 }
 
+// --- ADDED: Helper to resolve the requesting moderator username (for PM delivery) ---
+async function getRequestingModUsername(context: any): Promise<string | null> {
+  // Devvit contexts sometimes expose userName directly; fall back to fetching via userId if available.
+  const direct =
+    String((context as any)?.userName ?? (context as any)?.user?.username ?? (context as any)?.user?.name ?? '').trim();
+  if (direct) return normalizeUsername(direct);
+
+  const uid = String((context as any)?.userId ?? '').trim();
+  if (!uid) return null;
+
+  try {
+    const u = await (context as any).reddit?.getUserById?.(uid);
+    const name = String(u?.username ?? u?.name ?? '').trim();
+    return name ? normalizeUsername(name) : null;
+  } catch {
+    return null;
+  }
+}
+
+// --- ADDED: Send a private message as the subreddit to a specific moderator (best-effort for API shape) ---
+async function sendStrikeReportPmAsSubreddit(
+  context: any,
+  subredditName: string,
+  toUsername: string,
+  subject: string,
+  bodyText: string
+): Promise<void> {
+  const reddit = (context as any).reddit;
+  if (!reddit?.sendPrivateMessageAsSubreddit) {
+    throw new Error('sendPrivateMessageAsSubreddit API not available');
+  }
+
+  // Different Devvit versions have used slightly different parameter names; try the common shapes.
+  try {
+    await reddit.sendPrivateMessageAsSubreddit({
+      fromSubredditName: subredditName,
+      to: toUsername,
+      subject,
+      text: bodyText,
+    });
+    return;
+  } catch {
+    // Try "body" as an alternative.
+  }
+
+  await reddit.sendPrivateMessageAsSubreddit({
+    fromSubredditName: subredditName,
+    to: toUsername,
+    subject,
+    body: bodyText,
+  });
+}
+
+
 function toApiModNoteLabel(label: string | undefined | null): string | undefined {
   const l = (label ?? '').trim();
   if (!l) return undefined;
@@ -605,8 +659,9 @@ function toApiModNoteLabel(label: string | undefined | null): string | undefined
 }
 
 function formatStrikeList(records: StrikeRecord[], windowDays: number): string {
-  if (!records.length) return `No strikes in the last ${windowDays} days.`;
-  const sorted = [...records].sort((a, b) => b.t - a.t).slice(0, 50);
+  const visible = pruneToWindow(records, windowDays);
+  if (!visible.length) return `No strikes in the last ${windowDays} days.`;
+  const sorted = [...visible].sort((a, b) => b.t - a.t).slice(0, 50);
   return sorted
     .map((r, i) => {
       const d = new Date(r.t).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
@@ -621,9 +676,10 @@ async function formatStrikeListWithLinks(
   windowDays: number,
   subredditName: string
 ): Promise<string> {
-  if (!records.length) return `No strikes in the last ${windowDays} days.`;
+  const visible = pruneToWindow(records, windowDays);
+  if (!visible.length) return `No strikes in the last ${windowDays} days.`;
 
-  const sorted = [...records].sort((a, b) => b.t - a.t).slice(0, 30);
+  const sorted = [...visible].sort((a, b) => b.t - a.t).slice(0, 30);
 
   // Best-effort: get accurate permalinks for comments (limited to avoid API spam)
   const lines: string[] = [];
@@ -676,7 +732,7 @@ const strikeLookupForm = Devvit.createForm(
         label: 'Username (without u/)',
         helpText: 'Example: hermit_toad',
         required: true,
-      },
+      },  
     ],
     acceptLabel: 'Lookup',
   }),
@@ -716,7 +772,22 @@ const strikeLookupForm = Devvit.createForm(
 ` +
       list;
 
-    await context.ui.showForm(strikeViewForm, { results });
+    // --- CHANGED: Deliver the strike report via private message to the requesting moderator (mobile-friendly) ---
+    const requestingMod = await getRequestingModUsername(context);
+    const subject = `StrikeBot report for u/${username}`;
+    if (!requestingMod) {
+      // Fallback: if we can't resolve the requesting moderator username, show the existing results modal.
+      await context.ui.showForm(strikeViewForm, { results });
+      return;
+    }
+
+    try {
+      await sendStrikeReportPmAsSubreddit(context, subredditName, requestingMod, subject, results);
+      context.ui.showToast(`Sent strike report to u/${requestingMod} (Inbox).`);
+    } catch (e) {
+      // If PM fails for any reason, fall back to the existing results modal so the lookup still works.
+      await context.ui.showForm(strikeViewForm, { results });
+    }
   }
 );
 
