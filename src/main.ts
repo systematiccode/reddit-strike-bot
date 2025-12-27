@@ -730,7 +730,7 @@ const strikeLookupForm = Devvit.createForm(
         type: 'string',
         name: 'username',
         label: 'Username (without u/)',
-        helpText: 'Example: hermit_toad',
+        helpText: 'Example: raypogo',
         required: true,
       },  
     ],
