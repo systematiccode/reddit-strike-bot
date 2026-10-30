@@ -279,6 +279,11 @@ function pruneToWindow(records: StrikeRecord[], windowDays: number): StrikeRecor
   return records.filter((r) => typeof r?.t === 'number' && r.t >= cutoff);
 }
 
+
+function alreadyHasStrike(records: StrikeRecord[], targetId: string): boolean {
+  return records.some((r) => r.targetId === targetId);
+}
+
 function matchAnyTag(haystack: string, tags: string[]): string[] {
   const text = (haystack || '').toLowerCase();
   return tags.filter((t) => t && text.includes(t));
@@ -719,7 +724,7 @@ async function formatStrikeListWithLinks(
 ${url}`);
   }
 
-  return lines.join('');
+  return lines.join('\n\n');
 }
 
 const strikeLookupForm = Devvit.createForm(
@@ -759,7 +764,7 @@ const strikeLookupForm = Devvit.createForm(
     const records = pruneToWindow(await loadStrikeRecords(context, context.subredditId, userId), cfg.windowDays);
 
     // Larger/scrollable results view (Paragraph). Tip: click inside the box, then scroll.
-    const subredditName = await context.reddit.getCurrentSubredditName();
+    const subredditName = await getSubredditName(context);
     const list = await formatStrikeListWithLinks(context, records, cfg.windowDays, subredditName);
 
     const results =
@@ -1033,6 +1038,11 @@ Devvit.addTrigger({
     const pruned = pruneToWindow(existing, cfg.windowDays);
     if (pruned.length !== existing.length) {
       log(context, cfg.debug, `[STORE] pruned`, { before: existing.length, after: pruned.length });
+    }
+
+    if (alreadyHasStrike(pruned, targetId)) {
+      log(context, cfg.debug, `[SKIP] permanent duplicate strike prevented`, { targetId });
+      return;
     }
 
     const newRecord: StrikeRecord = { t: nowMs(), kind: kindFromId, targetId };
